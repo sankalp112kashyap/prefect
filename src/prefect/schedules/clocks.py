@@ -22,35 +22,33 @@ class ClockEvent:
         self.labels = labels
 
     def __eq__(self, other: Any) -> bool:
-        if not isinstance(other, (ClockEvent, datetime)):
-            return False
         if isinstance(other, datetime):
             return self.start_time == other
-        return (
-            self.start_time == other.start_time
-            and self.parameter_defaults == other.parameter_defaults
-            and self.labels == other.labels
-        )
+        if isinstance(other, ClockEvent):
+            return (
+                self.start_time == other.start_time
+                and self.parameter_defaults == other.parameter_defaults
+                and self.labels == other.labels
+            )
+        return False
 
     def __gt__(self, other: Union[datetime, "ClockEvent"]) -> bool:
         if not isinstance(other, (ClockEvent, datetime)):
             raise TypeError(
-                "'>' not supported between instances of 'ClockEvent' and {}".format(
+                "'>' not supported between 'ClockEvent' and {}".format(
                     type(other).__name__
                 )
             )
-        else:
-            return self.start_time > other
+        return self.start_time > getattr(other, "start_time", other)
 
     def __lt__(self, other: Union[datetime, "ClockEvent"]) -> bool:
         if not isinstance(other, (ClockEvent, datetime)):
             raise TypeError(
-                "'<' not supported between instances of 'ClockEvent' and {}".format(
+                "'<' not supported between 'ClockEvent' and {}".format(
                     type(other).__name__
                 )
             )
-        else:
-            return self.start_time < other
+        return self.start_time < getattr(other, "start_time", other)
 
 
 class Clock:
@@ -164,48 +162,23 @@ class IntervalClock(Clock):
         Returns:
             - Iterable[ClockEvent]: the next scheduled events
         """
-        if after is None:
-            after = pendulum.now("utc")
-
+        after = after or pendulum.now("utc")
         start_date = self.start_date or pendulum.datetime(2019, 1, 1)
-
-        assert isinstance(after, datetime)  # mypy assertion
-        assert isinstance(start_date, pendulum.DateTime)  # mypy assertion
-
         after = pendulum.instance(after)
 
-        # Use the difference between the `after` date and the `start_date` to calc the
-        # number of intervals we can skip over
-        skip = (after - start_date).total_seconds() / self.interval.total_seconds()
-
-        # if the after date is before the start date, we jump to the start date
-        if skip < 0:
-            skip = 0
-        # if the `after` date falls exactly on an interval, jump to the next interval
-        elif int(skip) == skip:
-            skip += 1
-        # otherwise jump to the next integer interval
-        else:
-            skip = int(skip + 1)
-
+        skip = max(0, (after - start_date).total_seconds() / self.interval.total_seconds())
+        skip = int(skip + (1 if int(skip) == skip else 1))
         interval = self.interval * skip
 
         while True:
-            # in order to handle daylight saving time boundries, we consider the interval
-            # "days" separate from "seconds"; this allows Pendulum DST logic to work
-            days = interval.days
-            seconds = interval.total_seconds() - (days * 24 * 60 * 60)
+            days, seconds = interval.days, interval.total_seconds() - (interval.days * 24 * 60 * 60)
             next_date = start_date.add(days=days, seconds=seconds)
             if next_date < after:
                 interval += self.interval
                 continue
             if self.end_date and next_date > self.end_date:
                 break
-            yield ClockEvent(
-                start_time=next_date,
-                parameter_defaults=self.parameter_defaults,
-                labels=self.labels,
-            )
+            yield ClockEvent(next_date, self.parameter_defaults, self.labels)
             interval += self.interval
 
 
@@ -278,57 +251,33 @@ class CronClock(Clock):
             - Iterable[ClockEvent]: the next scheduled events
         """
         tz = getattr(self.start_date, "tz", "UTC")
-        if after is None:
-            after = pendulum.now(tz)
-        else:
-            after = pendulum.instance(after).in_tz(tz)
+        after = pendulum.instance(after or pendulum.now(tz)).in_tz(tz)
+        
+        if self.start_date:
+            after = max(after, self.start_date - timedelta(seconds=1))
 
-        # if there is a start date, advance to at least one second before the start (so that
-        # the start date itself will be registered as a valid clock date)
-        if self.start_date is not None:
-            after = max(after, self.start_date - timedelta(seconds=1))  # type: ignore
-
-        assert isinstance(after, datetime)  # mypy assertion
-        after = pendulum.instance(after)
-        assert isinstance(after, pendulum.DateTime)  # mypy assertion
-        assert isinstance(after.tz, pendulum.tz._Timezone)  # mypy assertion
-
-        # croniter's DST logic interferes with all other datetime libraries except pytz
         after_localized = pytz.timezone(after.tz.name).localize(
             datetime(
-                year=after.year,
-                month=after.month,
-                day=after.day,
-                hour=after.hour,
-                minute=after.minute,
-                second=after.second,
-                microsecond=after.microsecond,
+                year=after.year, month=after.month, day=after.day,
+                hour=after.hour, minute=after.minute, second=after.second,
+                microsecond=0 if after.microsecond else 0
             )
         )
 
-        # Respect microseconds by rounding up
         if after_localized.microsecond:
-            after_localized = after_localized + timedelta(seconds=1)
+            after_localized += timedelta(seconds=1)
 
-        cron = croniter(self.cron, after_localized, day_or=self.day_or)  # type: ignore
-        dates = set()  # type: Set[datetime]
+        cron = croniter(self.cron, after_localized, day_or=self.day_or)
+        dates = set()
 
         while True:
             next_date = pendulum.instance(cron.get_next(datetime))
-            # because of croniter's rounding behavior, we want to avoid
-            # issuing the after date; we also want to avoid duplicates caused by
-            # DST boundary issues
             if next_date.in_tz("UTC") == after.in_tz("UTC") or next_date in dates:
                 next_date = pendulum.instance(cron.get_next(datetime))
-
             if self.end_date and next_date > self.end_date:
                 break
             dates.add(next_date)
-            yield ClockEvent(
-                start_time=next_date,
-                parameter_defaults=self.parameter_defaults,
-                labels=self.labels,
-            )
+            yield ClockEvent(next_date, self.parameter_defaults, self.labels)
 
 
 class DatesClock(Clock):
@@ -368,14 +317,9 @@ class DatesClock(Clock):
         Returns:
             - Iterable[ClockEvent]: the next scheduled events
         """
-        if after is None:
-            after = pendulum.now("UTC")
+        after = after or pendulum.now("UTC")
         yield from (
-            ClockEvent(
-                start_time=date,
-                parameter_defaults=self.parameter_defaults,
-                labels=self.labels,
-            )
+            ClockEvent(date, self.parameter_defaults, self.labels)
             for date in sorted(self.dates)
             if date > after
         )
